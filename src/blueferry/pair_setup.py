@@ -19,6 +19,7 @@ from blueferry import bluetooth_capabilities as capabilities
 from blueferry import config, pairing_diagnostics, quirks_report
 from blueferry.bearer_supervisor import preferred_bearer_unavailable
 from blueferry.bluetooth_devices import PairedDevice
+from blueferry.bluez_reads import observations
 from blueferry.bus import get_session_bus, get_system_bus
 from blueferry.calls.settings import calls_enabled
 from blueferry.commands import run_command
@@ -257,23 +258,29 @@ def _take_pending_teardown(adapter: str) -> dict[str, object] | None:
 
 
 def bond_status(
-    mac: str, adapter: str, *, timeout: float | None = None,
+    mac: str, adapter: str, *, timeout: float | None = None, cached: bool = False,
 ) -> bool | None:
     """Return paired state, or ``None`` if the adapter cannot be inspected.
 
     Merely retaining a MAC in ``local.env`` is not proof of a usable setup:
     package removal deliberately preserves that file while a user may remove
-    the BlueZ bond independently. Callers on the daemon's main loop pass a
-    short ``timeout`` so a wedged bluetoothd cannot stall every client call.
+    the BlueZ bond independently. Periodic main-loop checks use ``cached``
+    to request a bounded asynchronous snapshot; pending or expired evidence
+    remains unknown. Setup callers can request a fresh synchronous read.
     """
     adapter_path = f"/org/bluez/{adapter}"
     device_path = f"{adapter_path}/dev_{mac.replace(':', '_')}"
     try:
-        manager = _object_manager()
-        managed = (
-            manager.GetManagedObjects() if timeout is None
-            else manager.GetManagedObjects(timeout=timeout)
-        )
+        if cached:
+            managed = observations.read(
+                "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", "", (),
+            )
+        else:
+            manager = _object_manager()
+            managed = (
+                manager.GetManagedObjects() if timeout is None
+                else manager.GetManagedObjects(timeout=timeout)
+            )
     except dbus.exceptions.DBusException:
         return None
     adapter_ifaces = managed.get(dbus.ObjectPath(adapter_path), managed.get(adapter_path))

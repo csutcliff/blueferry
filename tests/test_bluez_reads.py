@@ -89,3 +89,29 @@ def test_late_snapshot_cannot_survive_owner_or_topology_change(reads, invalidati
     pending(read)
     calls[-1][-2]({"fresh": True})
     assert read() == {"fresh": True}
+
+
+def test_periodic_bond_check_distinguishes_unknown_from_removed(reads, monkeypatch):
+    from blueferry import pair_setup
+
+    cache, calls, now = reads
+    monkeypatch.setattr(pair_setup, "observations", cache)
+    monkeypatch.setattr(pair_setup, "_object_manager", lambda: pytest.fail("synchronous bond read"))
+    adapter = "/org/bluez/hci0"
+    device = adapter + "/dev_AA_BB_CC_DD_EE_FF"
+
+    def bonded():
+        return pair_setup.bond_status("AA:BB:CC:DD:EE:FF", "hci0", cached=True)
+
+    assert bonded() is None
+    calls[-1][-2]({adapter: {"org.bluez.Adapter1": {}},
+                  device: {"org.bluez.Device1": {"Paired": True}}})
+    assert bonded() is True
+    now[0] = 11
+    assert bonded() is None  # A wedged BlueZ is not an explicit unpair.
+    calls[-1][-2]({})
+    assert bonded() is None  # Missing controller is also transient.
+    cache.invalidate_managed_objects()
+    assert bonded() is None
+    calls[-1][-2]({adapter: {"org.bluez.Adapter1": {}}})
+    assert bonded() is False  # Controller present, saved phone gone.
