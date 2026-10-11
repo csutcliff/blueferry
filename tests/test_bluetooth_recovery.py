@@ -1283,3 +1283,29 @@ def test_inspection_separates_phone_reset_from_adapter_cycle(bluez, reason):
     state = adapter.read()
     assert state.le_reset_safe
     assert not state.safe
+
+
+def test_main_loop_snapshot_is_async_and_safety_signals_invalidate_it(bluez, monkeypatch):
+    from copy import deepcopy
+
+    from blueferry.bluez_reads import BluezReadCache
+
+    adapter, fake = bluez
+    calls = []
+    cache = BluezReadCache(lambda: SimpleNamespace(
+        call_async=lambda *args, **_kwargs: calls.append(args),
+    ))
+    monkeypatch.setattr(mod, "observations", cache)
+    adapter.cached_reads = True
+    fake.GetManagedObjects = lambda **_kwargs: pytest.fail("main loop used synchronous BlueZ read")
+    with pytest.raises(mod.dbus.exceptions.DBusException):
+        adapter.read()
+    calls[-1][-2](deepcopy(fake.objects))
+    assert adapter.read().le_reset_safe
+    fake.objects[adapter.device_path]["org.bluez.Device1"]["Blocked"] = True
+    adapter._properties_changed("org.bluez.Device1", {"Blocked": True}, [], path=adapter.device_path)
+    with pytest.raises(mod.dbus.exceptions.DBusException):
+        adapter.read()
+    calls[-1][-2](deepcopy(fake.objects))
+    assert not adapter.read().le_reset_safe
+    assert fake.writes == []

@@ -12,6 +12,7 @@ from pathlib import Path
 import dbus
 from gi.repository import GLib
 
+from blueferry.bluez_reads import observations
 from blueferry.bus import get_system_bus, obex
 from blueferry.obex.worker import ObexWorker
 from blueferry.settings_store import (
@@ -57,7 +58,9 @@ class _PowerRestore:
 class BluezRecoveryAdapter:
     """Use only the selected controller, pinned to its BlueZ owner and address."""
 
-    def __init__(self, adapter: str, phone: str, *, settings: SettingsStore | None = None) -> None:
+    def __init__(self, adapter: str, phone: str, *, settings: SettingsStore | None = None,
+                 cached_reads: bool = False) -> None:
+        self.cached_reads = cached_reads
         self.path = f"/org/bluez/{adapter}"
         self.device_path = f"{self.path}/dev_{phone.replace(':', '_')}"
         self._revision = 0
@@ -201,18 +204,22 @@ class BluezRecoveryAdapter:
         if path == self.path and "org.bluez.Adapter1" in interfaces:
             self._incarnation += 1
             self._revision += 1
+            observations.invalidate_managed_objects()
         elif str(path).startswith(self.path + "/") and any(
             name in interfaces for name in (
                 "org.bluez.Device1", "org.bluez.Bearer.LE1", "org.bluez.Bearer.BREDR1",
             )
         ):
             self._revision += 1
+            observations.invalidate_managed_objects()
 
     def _owner_changed(self, _name, _old, _new) -> None:
+        observations.invalidate()
         self._incarnation += 1
         self._revision += 1
 
     def _properties_changed(self, interface, changed, invalidated, *, path) -> None:
+        observations.properties_changed(str(path), str(interface), changed, invalidated)
         names = set(changed) | set(invalidated)
         relevant = False
         if path == self.path and interface == "org.bluez.Adapter1":
@@ -237,6 +244,7 @@ class BluezRecoveryAdapter:
                 relevant = "Connected" in names
         if relevant:
             self._revision += 1
+            observations.invalidate_managed_objects()
 
     def read(self) -> AdapterState:
         revision = self._revision
@@ -245,7 +253,11 @@ class BluezRecoveryAdapter:
         owner = str(bus.get_name_owner("org.bluez"))
         manager = dbus.Interface(bus.get_object(owner, "/", introspect=False),
                                  "org.freedesktop.DBus.ObjectManager")
-        objects = manager.GetManagedObjects(timeout=5.0)
+        if self.cached_reads and threading.current_thread() is threading.main_thread():
+            objects = observations.read("/", "org.freedesktop.DBus.ObjectManager",
+                                        "GetManagedObjects", "", (), owner=owner)
+        else:
+            objects = manager.GetManagedObjects(timeout=5.0)
         props = objects[self.path]["org.bluez.Adapter1"]
         phone = objects.get(self.device_path, {}).get("org.bluez.Device1", {})
         powered = bool(props["Powered"])

@@ -38,6 +38,7 @@ from blueferry.bluetooth_recovery import (
     RecoveryObservation,
     probe_map,
 )
+from blueferry.bluez_reads import observations
 from blueferry.build_info import build_id, installed_build_sha, running_build_sha
 from blueferry.bus import get_system_bus, main_loop
 from blueferry.call_history import (
@@ -218,7 +219,13 @@ class Daemon:
         self._mpris_connection: dbus.connection.Connection | None = None
         self._mpris_claim: NameClaim | None = None
         self._mpris_retry_id: int | None = None
-        self.adapter_class = AdapterClassSupervisor(config.ADAPTER)
+        self.adapter_class = AdapterClassSupervisor(
+            config.ADAPTER,
+            read_class=lambda adapter: observations.property(
+                f"/org/bluez/{adapter}", "org.bluez.Adapter1", "Class",
+                on_ready=self.adapter_class.recheck,
+            ),
+        )
         self.solicitation = SolicitationSupervisor(config.ADAPTER)
         # The saved phone-calls opt-in decides both the call controller and
         # whether the WirePlumber fragment keeps the hands-free roles.
@@ -351,9 +358,12 @@ class Daemon:
             ),
             attempt_ready=lambda: classic_reachable(self.bearers, self.sessions),
         )
+        recovery_adapter = BluezRecoveryAdapter(
+            config.ADAPTER, config.IPHONE_MAC, cached_reads=True,
+        )
         self.recovery = BluetoothRecovery(
             config.IPHONE_MAC,
-            BluezRecoveryAdapter(config.ADAPTER, config.IPHONE_MAC),
+            recovery_adapter,
             self.obex_worker,
             observe=self._recovery_observation,
             probe=lambda: probe_map(self.sessions.map_path),
@@ -365,6 +375,10 @@ class Daemon:
 
     def _recovery_observation(self) -> RecoveryObservation:
         ancs = self.ancs
+        self.bearers.observe_ancs_health(
+            bool(ancs and ancs.connected and not ancs.permission_denied),
+            ancs.health_proof if ancs else None,
+        )
         return RecoveryObservation(
             healthy=bool(ancs and ancs.connected and not ancs.permission_denied),
             health_proof=ancs.health_proof if ancs else None,
@@ -1095,6 +1109,7 @@ class Daemon:
             self.proximity.inhibit(INHIBIT_DISCOVERING, False)
         # Bearer observations from the old bluetoothd no longer prove presence.
         self.proximity.reset()
+        observations.invalidate()
         if old_owner:
             bluez_setup.forget_advert_registration()
         if new_owner and not self.recovery.active:
