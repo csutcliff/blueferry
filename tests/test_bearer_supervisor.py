@@ -182,9 +182,9 @@ def test_enabling_le_hands_preference_back_before_any_le_dial() -> None:
     supervisor.start()
     supervisor.enable_le()
 
-    assert calls == [("prefer", "le")]
+    assert calls == [("prefer", "bredr")]
     scheduled[-1][1]()
-    assert calls == [("prefer", "le"), ("connect", "le")]
+    assert calls == [("prefer", "bredr"), ("connect", "le")]
 
 
 def test_le_can_be_held_again_during_a_later_profile_reconnect() -> None:
@@ -268,11 +268,11 @@ def test_hold_cancels_in_flight_le_once_but_keeps_a_late_connection() -> None:
     assert observed == [False, True]
 
     supervisor.enable_le()
-    assert preferences == []
+    assert preferences == ["bredr"]
     assert [kind for kind, _callback in connect_callbacks] == ["le"]
 
 
-def test_untyped_classic_connect_restores_le_preference_before_le_dial() -> None:
+def test_untyped_classic_connect_keeps_background_le_disabled() -> None:
     state = {"bredr": False, "le": False}
     calls = []
     scheduled = []
@@ -294,7 +294,7 @@ def test_untyped_classic_connect_restores_le_preference_before_le_dial() -> None
     assert calls == [
         ("prefer", "bredr"),
         ("connect", "bredr"),
-        ("prefer", "le"),
+        ("prefer", "bredr"),
     ]
 
     state["bredr"] = True
@@ -303,7 +303,7 @@ def test_untyped_classic_connect_restores_le_preference_before_le_dial() -> None
     assert calls == [
         ("prefer", "bredr"),
         ("connect", "bredr"),
-        ("prefer", "le"),
+        ("prefer", "bredr"),
         ("connect", "le"),
     ]
 
@@ -314,14 +314,13 @@ def test_untyped_classic_connect_restores_le_preference_before_le_dial() -> None
     assert supervisor._failures["bredr"] == 0
     assert supervisor._next_attempt["bredr"] == 0.0
 
-    # A later out-of-range cycle repeats the handoff instead of leaving the
-    # idle preference on BR/EDR after its untyped bootstrap.
+    # A later out-of-range cycle must not re-enable background LE dialing.
     state["bredr"] = False
     scheduled[0][1]()
     assert calls[-3:] == [
         ("prefer", "bredr"),
         ("connect", "bredr"),
-        ("prefer", "le"),
+        ("prefer", "bredr"),
     ]
 
 
@@ -357,7 +356,7 @@ def test_enabling_le_waits_for_an_outstanding_classic_connect() -> None:
     assert calls == [
         ("prefer", "bredr"),
         ("connect", "bredr"),
-        ("prefer", "le"),
+        ("prefer", "bredr"),
     ]
 
     supervisor.poke()
@@ -471,7 +470,7 @@ def test_untyped_classic_already_connected_rechecks_bearers_before_success() -> 
     assert supervisor._next_attempt["bredr"] == 0.0
 
 
-def test_le_settle_retries_failed_preference_handoff_without_blocking_dial() -> None:
+def test_le_settle_waits_for_background_autoconnect_to_be_disabled() -> None:
     state = {"bredr": True, "le": False}
     calls = []
     scheduled = []
@@ -502,12 +501,11 @@ def test_le_settle_retries_failed_preference_handoff_without_blocking_dial() -> 
     settle()
 
     assert calls == [
-        ("prefer", "le"),
-        ("prefer", "le"),
-        ("prefer", "le"),
-        ("connect", "le"),
+        ("prefer", "bredr"),
+        ("prefer", "bredr"),
+        ("prefer", "bredr"),
     ]
-    assert supervisor._le_preference_restore_pending is True
+    assert supervisor._le_autoconnect_disable_pending is True
 
 
 def test_live_le_dials_classic_without_rewriting_preference() -> None:
@@ -2184,3 +2182,62 @@ def test_preference_write_uses_variant_on_the_wire_and_surfaces_method_errors(mo
         supervisor._prefer_bluez("le")
         assert bus.preference == "le"
     assert bus.signatures == [("Get", "ss"), ("Set", "ssv")]
+
+
+def test_failed_bootstrap_leaves_background_autoconnect_disabled() -> None:
+    # Model BlueZ's PreferredBearer side effect, starting with a persisted
+    # preference from an older BlueFerry process. A targeted disconnect alone
+    # does not remove the kernel auto-connect policy.
+    state = {"bredr": True, "le": False}
+    background = [True]
+    attempts = []
+    scheduled = []
+    now = [0.0]
+
+    def prefer(kind):
+        background[0] = kind == "le"
+
+    def connect(kind, _success, error):
+        assert background[0] is False
+        attempts.append(kind)
+        error(RuntimeError("le-connection-abort-by-local"))
+
+    supervisor = BearerSupervisor(
+        "/device", read_connected=state.get, prefer=prefer, connect=connect,
+        schedule=lambda delay, cb: scheduled.append((delay, cb)) or 7,
+        cancel=lambda _timer: None, clock=lambda: now[0],
+    )
+    supervisor.start()
+    settle = next(cb for delay, cb in scheduled
+                  if delay == bearer_supervisor.CLASSIC_SETTLE_SECONDS)
+    settle()
+    for tick in range(1, 50):
+        now[0] = tick * 5.0
+        supervisor.poke()
+    assert attempts == ["le"]
+    assert background[0] is False
+
+    # A bluetoothd restart can reload the old preference; suppress it again.
+    background[0] = True
+    supervisor.reset_after_bluez_restart()
+    assert background[0] is False
+
+    # Inbound LE is still published without switching auto-connect back on.
+    state["le"] = True
+    supervisor.poke()
+    assert supervisor.le_connected is True
+    assert background[0] is False
+
+
+def test_unknown_le_state_does_not_rewrite_background_connection_policy() -> None:
+    preferences = []
+    supervisor = BearerSupervisor(
+        "/device", read_connected=lambda kind: True if kind == "bredr" else None,
+        prefer=preferences.append, connect=lambda *_args: None,
+        schedule=lambda *_args: 7, cancel=lambda _timer: None,
+        le_enabled=False,
+    )
+    supervisor.start()
+    supervisor.enable_le()
+    supervisor.poke()
+    assert preferences == []

@@ -302,7 +302,7 @@ class BearerSupervisor:
         # remains the exact value published to ANCS consumers.
         self._le_targeting_hint = False
         self._le_dial_active = False
-        self._le_preference_restore_pending = False
+        self._le_autoconnect_disable_pending = True
         # Outbound Bearer.LE1.Connect is only a bootstrap hint.  Real-device
         # traces show the solicitation advertisement to be the reliable
         # reconnect path, while repeating Connect can leave BlueZ in an
@@ -377,6 +377,7 @@ class BearerSupervisor:
         if self._running:
             return
         self._running = True
+        self._le_autoconnect_disable_pending = True
         self._start_le_watch()
         self._tick()
         self._timer_id = self._schedule(POLL_SECONDS, self._tick)
@@ -393,14 +394,13 @@ class BearerSupervisor:
             return
         self._le_enabled = True
         log.info("MAP/PBAP attempt completed; enabling outbound iPhone LE bootstrap")
-        if self._states["le"] is not True:
-            # Pairing deliberately leaves the untyped Device1.Connect path on
-            # BR/EDR while MAP/PBAP get their first turn. Hand inbound control
-            # back once here, before either an LE dial or a solicited link is
-            # in flight. Bearer.LE1.Connect already names its transport and
-            # must not rewrite PreferredBearer underneath itself.
-            self._le_preference_restore_pending = True
-            self._restore_le_preference()
+        if self._states["le"] is False:
+            # PreferredBearer=le enables BlueZ/kernel auto-connect, which can
+            # keep initiating after our bounded dial has ended and starve the
+            # solicitation advertisement. Explicit Bearer.LE1.Connect and
+            # incoming LE links do not require that preference.
+            self._le_autoconnect_disable_pending = True
+            self._suppress_le_autoconnect()
         if self._running:
             self._tick()
 
@@ -442,7 +442,7 @@ class BearerSupervisor:
         self._disconnecting.clear()
         self._set_le_dial_active(False)
         self._le_targeting_hint = False
-        self._le_preference_restore_pending = False
+        self._le_autoconnect_disable_pending = True
         self._le_dial_spent = False
         self._le_reset_pending = False
         self._le_reset_failures = 0
@@ -510,7 +510,7 @@ class BearerSupervisor:
         self._disconnecting.clear()
         self._set_le_dial_active(False)
         self._le_targeting_hint = False
-        self._le_preference_restore_pending = False
+        self._le_autoconnect_disable_pending = False
         self._le_dial_spent = False
         self._le_reset_pending = False
         self._cancel_le_settle()
@@ -807,7 +807,7 @@ class BearerSupervisor:
         if bredr is False:
             self._request_connect("bredr")
         elif bredr is True and le is False and self._le_enabled:
-            self._restore_le_preference()
+            self._suppress_le_autoconnect()
             if "bredr" not in self._connecting:
                 self._schedule_le_connect()
         elif le is True:
@@ -841,12 +841,9 @@ class BearerSupervisor:
             and self._le_enabled
             and self._le_api_available is not False
         ):
-            # The handoff may have failed when LE was enabled or when this
-            # timer was armed. Retry at the last safe point before the
-            # targeted dial; a transient Set failure must not suppress the
-            # one outbound bootstrap, and the pending flag remains set so a
-            # later Classic-up/LE-down tick can try again.
-            self._restore_le_preference()
+            self._suppress_le_autoconnect()
+            if self._le_autoconnect_disable_pending:
+                return False
             self._request_connect("le")
         elif bredr is False:
             self._request_connect("bredr")
@@ -1040,7 +1037,7 @@ class BearerSupervisor:
                     # _connect_bluez uses targeted Bearer.BREDR1.Connect and
                     # leaves the preference untouched.
                     self._prefer("bredr")
-                    self._le_preference_restore_pending = True
+                    self._le_autoconnect_disable_pending = True
             else:
                 # Advertising while this asynchronous call is outstanding can
                 # abort the dial locally. The daemon withdraws solicitation
@@ -1072,7 +1069,7 @@ class BearerSupervisor:
             self._set_le_dial_active(False)
         self._last_errors.pop(kind, None)
         if kind == "bredr":
-            self._restore_le_preference()
+            self._suppress_le_autoconnect()
         # A successful method reply only means BlueZ accepted the request; it
         # does not mean the bearer connected. Keep widening the quiet window
         # until an observed Connected=true resets it.
@@ -1227,24 +1224,24 @@ class BearerSupervisor:
         self._failures["bredr"] = 0
         self._next_attempt["bredr"] = 0.0
 
-    def _restore_le_preference(self) -> None:
-        """Hand untyped connects back to inbound LE once Classic is settled."""
+    def _suppress_le_autoconnect(self) -> None:
+        """Disable background LE dialing without touching an established link."""
         if (
-            not self._le_preference_restore_pending
+            not self._le_autoconnect_disable_pending
             or not self._le_enabled
-            or self._classic_connect_should_be_targeted()
+            or self._states["le"] is not False
             or self._connecting
         ):
             return
         try:
-            self._prefer("le")
+            self._prefer("bredr")
         except Exception as error:
             log.warning(
-                "could not hand PreferredBearer to inbound LE: %s",
+                "could not disable background LE auto-connect: %s",
                 error,
             )
             return
-        self._le_preference_restore_pending = False
+        self._le_autoconnect_disable_pending = False
 
     def _le_dial_exhausted(self) -> bool:
         """Yield to inbound solicitation only when it is actually on air."""
