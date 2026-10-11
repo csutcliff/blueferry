@@ -359,12 +359,13 @@ class Daemon:
             attempt_ready=lambda: classic_reachable(self.bearers, self.sessions),
         )
         recovery_adapter = BluezRecoveryAdapter(
-            config.ADAPTER, config.IPHONE_MAC, cached_reads=True,
+            config.ADAPTER, config.IPHONE_MAC,
         )
         self.recovery = BluetoothRecovery(
             config.IPHONE_MAC,
             recovery_adapter,
             self.obex_worker,
+            read_async=recovery_adapter.read_async,
             observe=self._recovery_observation,
             probe=lambda: probe_map(self.sessions.map_path),
             probe_health=lambda: self.ancs.probe_health() if self.ancs else None,

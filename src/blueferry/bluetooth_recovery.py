@@ -46,6 +46,9 @@ class AdapterState:
     le_reset_safe: bool = False
 
 
+ReadSnapshot = Callable[[Callable[[AdapterState], None], Callable[[Exception], None]], None]
+
+
 @dataclass
 class _PowerRestore:
     expected: AdapterState
@@ -58,9 +61,7 @@ class _PowerRestore:
 class BluezRecoveryAdapter:
     """Use only the selected controller, pinned to its BlueZ owner and address."""
 
-    def __init__(self, adapter: str, phone: str, *, settings: SettingsStore | None = None,
-                 cached_reads: bool = False) -> None:
-        self.cached_reads = cached_reads
+    def __init__(self, adapter: str, phone: str, *, settings: SettingsStore | None = None) -> None:
         self.path = f"/org/bluez/{adapter}"
         self.device_path = f"{self.path}/dev_{phone.replace(':', '_')}"
         self._revision = 0
@@ -253,11 +254,31 @@ class BluezRecoveryAdapter:
         owner = str(bus.get_name_owner("org.bluez"))
         manager = dbus.Interface(bus.get_object(owner, "/", introspect=False),
                                  "org.freedesktop.DBus.ObjectManager")
-        if self.cached_reads and threading.current_thread() is threading.main_thread():
-            objects = observations.read("/", "org.freedesktop.DBus.ObjectManager",
-                                        "GetManagedObjects", "", (), owner=owner)
-        else:
-            objects = manager.GetManagedObjects(timeout=5.0)
+        objects = manager.GetManagedObjects(signature="", timeout=5.0)
+        return self._state_from_objects(owner, objects, revision, incarnation)
+
+    def read_async(
+        self, on_success: Callable[[AdapterState], None], on_error: Callable[[Exception], None],
+    ) -> None:
+        """Inspect a fresh snapshot without blocking the main loop."""
+        revision, incarnation = self._revision, self._incarnation
+        bus = get_system_bus()
+        owner = str(bus.get_name_owner("org.bluez"))
+
+        def ready(objects):
+            try:
+                state = self._state_from_objects(owner, objects, revision, incarnation)
+            except Exception as error:
+                on_error(error)
+            else:
+                on_success(state)
+
+        bus.call_async(
+            owner, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects", "", (),
+            ready, on_error, timeout=5.0,
+        )
+
+    def _state_from_objects(self, owner, objects, revision, incarnation) -> AdapterState:
         props = objects[self.path]["org.bluez.Adapter1"]
         phone = objects.get(self.device_path, {}).get("org.bluez.Device1", {})
         powered = bool(props["Powered"])
@@ -457,6 +478,7 @@ class BluetoothRecovery:
         pause: Callable[[], None],
         resume: Callable[[], None],
         settings: SettingsStore | None = None,
+        read_async: ReadSnapshot | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         schedule=GLib.timeout_add_seconds,
@@ -466,6 +488,8 @@ class BluetoothRecovery:
         self.phone = phone.upper()
         self.adapter = adapter
         self.worker = worker
+        self._read_async = read_async
+        self._snapshot_pending = False
         self._observe = observe
         self._probe = probe
         self._probe_health = probe_health
@@ -534,6 +558,7 @@ class BluetoothRecovery:
     def invalidate(self, *, suspended: bool | None = None) -> None:
         """Discard observations across sleep, owner changes, and user power-off."""
         self._generation += 1
+        self._snapshot_pending = False
         if suspended is not None:
             self._suspended = suspended
         self._outage_since = None
@@ -600,7 +625,15 @@ class BluetoothRecovery:
             return True
         try:
             self.adapter.cleanup_journal()
-            self._check()
+            if self._read_async is None:
+                self._check()
+            elif not self._snapshot_pending:
+                self._snapshot_pending = True
+                generation = self._generation
+                self._read_async(
+                    lambda state: self._snapshot_ready(state, generation),
+                    lambda error: self._snapshot_failed(error, generation),
+                )
         except Exception:
             # Missing properties, bus errors, and unplugged controllers provide
             # no evidence of a stuck phone. Start a fresh observation window.
@@ -608,8 +641,26 @@ class BluetoothRecovery:
             self.invalidate()
         return True
 
-    def _check(self) -> None:
-        state = self.adapter.read()
+    def _snapshot_ready(self, state: AdapterState, generation: int) -> None:
+        if generation != self._generation or not self._running or self._suspended:
+            return
+        self._snapshot_pending = False
+        if self.active or self.adapter.restore_pending:
+            return
+        try:
+            self._check(state)
+        except Exception as error:
+            self._snapshot_failed(error, self._generation)
+
+    def _snapshot_failed(self, _error: Exception, generation: int) -> None:
+        if generation != self._generation or not self._running:
+            return
+        log.debug("Bluetooth recovery snapshot failed; restarting observation window")
+        self.invalidate()
+
+    def _check(self, state: AdapterState | None = None) -> None:
+        if state is None:
+            state = self.adapter.read()
         identity = (state.owner, state.address)
         if identity != self._identity:
             self.invalidate()
@@ -705,18 +756,35 @@ class BluetoothRecovery:
         self._probing = False
         self._outage_since = None
 
-    def _after_probe(self, generation: int, expected: AdapterState, when: float) -> bool:
+    def _after_probe(
+        self, generation: int, expected: AdapterState, when: float,
+        current: AdapterState | None = None,
+    ) -> bool:
         if generation != self._generation or not self._running or self._suspended:
             return False
-        self._probing = False
         if (
             self._clock() - when > 30
             or self._outage_since is None
             or self._clock() - self._outage_since < OUTAGE_SECONDS
         ):
+            self._probing = False
             return False
+        if current is None and self._read_async is not None:
+            def ready(state: AdapterState) -> None:
+                self._after_probe(generation, expected, when, state)
+
+            try:
+                self._read_async(
+                    ready,
+                    lambda error: self._snapshot_failed(error, generation),
+                )
+            except Exception as error:
+                self._snapshot_failed(error, generation)
+            return False
+        self._probing = False
         try:
-            current = self.adapter.read()
+            if current is None:
+                current = self.adapter.read()
             observed = self._observe()
             if (
                 current != expected or not current.safe or observed.healthy

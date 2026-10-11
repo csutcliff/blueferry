@@ -115,3 +115,21 @@ def test_periodic_bond_check_distinguishes_unknown_from_removed(reads, monkeypat
     assert bonded() is None
     calls[-1][-2]({adapter: {"org.bluez.Adapter1": {}}})
     assert bonded() is False  # Controller present, saved phone gone.
+
+
+def test_five_second_poll_jitter_does_not_expire_responsive_bearer(reads):
+    cache, calls, now = reads
+
+    def read():
+        return cache.property("/device", "org.bluez.Bearer.LE1", "Connected")
+
+    pending(read)
+    now[0] = 0.0001
+    calls[-1][-2](True)
+    now[0] = 5.0
+    assert read() is True
+    now[0] += 0.0001
+    calls[-1][-2](True)
+    now[0] = 10.001
+    assert read() is True
+    assert len(calls) == 3

@@ -9,6 +9,10 @@ import dbus
 
 from blueferry.bus import get_system_bus
 
+# Leave margin before five-second consumers poll again. A threshold of five
+# can skip that poll because the last reply arrived just after its request.
+REFRESH_AFTER_SECONDS = 4.0
+
 
 class BluezReadCache:
     """Coalesce reads; never return stale evidence after an error or timeout."""
@@ -48,7 +52,7 @@ class BluezReadCache:
         key = (owner, path, interface, method, signature, args)
         now = self._clock()
         entry = self._entries.get(key)
-        if key not in self._pending and (entry is None or now - entry[0] >= 5):
+        if key not in self._pending and (entry is None or now - entry[0] >= REFRESH_AFTER_SECONDS):
             generation = self._generation
             token = object()
             self._pending[key] = token
