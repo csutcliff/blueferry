@@ -1468,6 +1468,7 @@ class BearerSupervisor:
                 properties.Get(
                     "org.bluez.Device1",
                     "PreferredBearer",
+                    signature="ss",
                     timeout=5.0,
                 )
             )
@@ -1486,11 +1487,15 @@ class BearerSupervisor:
                 "org.bluez.Device1",
                 "PreferredBearer",
                 dbus.String(kind),
+                signature="ssv",
                 timeout=5.0,
             )
             log.debug("set iPhone PreferredBearer=%s", kind)
         except dbus.exceptions.DBusException as error:
-            if preferred_bearer_unavailable(error):
+            # Get succeeded (or failed transiently), so an UnknownMethod
+            # from Set may be a malformed request, not a missing property.
+            if (preferred_bearer_unavailable(error)
+                    and error.get_dbus_name() != "org.freedesktop.DBus.Error.UnknownMethod"):
                 log.debug("PreferredBearer is unavailable on this BlueZ build")
                 return
             raise

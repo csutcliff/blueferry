@@ -566,12 +566,12 @@ def test_bluez_preference_selects_requested_bearer(monkeypatch) -> None:
 
     class Properties:
         @staticmethod
-        def Get(interface, name, *, timeout):
+        def Get(interface, name, *, signature, timeout):
             calls.append(("get", interface, name, timeout))
             return "bredr"
 
         @staticmethod
-        def Set(interface, name, value, *, timeout):
+        def Set(interface, name, value, *, signature, timeout):
             calls.append((interface, name, str(value), timeout))
 
     class Bus:
@@ -707,14 +707,14 @@ def test_bluez_falls_back_when_classic_bearer_is_marker_only(monkeypatch) -> Non
 def test_bluez_preference_ignores_a_missing_preferred_bearer_property(monkeypatch) -> None:
     class Properties:
         @staticmethod
-        def Get(_interface, _name, *, timeout):
+        def Get(_interface, _name, *, signature, timeout):
             raise bearer_supervisor.dbus.exceptions.DBusException(
                 "No such property 'PreferredBearer'",
                 name="org.bluez.Error.InvalidArguments",
             )
 
         @staticmethod
-        def Set(_interface, _name, _value, *, timeout):
+        def Set(_interface, _name, _value, *, signature, timeout):
             raise bearer_supervisor.dbus.exceptions.DBusException(
                 "No such property 'PreferredBearer'",
                 name="org.bluez.Error.InvalidArguments",
@@ -741,12 +741,12 @@ def test_bluez_preference_skips_set_when_already_selected(monkeypatch) -> None:
 
     class Properties:
         @staticmethod
-        def Get(_interface, _name, *, timeout):
+        def Get(_interface, _name, *, signature, timeout):
             calls.append("get")
             return "le"
 
         @staticmethod
-        def Set(_interface, _name, _value, *, timeout):
+        def Set(_interface, _name, _value, *, signature, timeout):
             calls.append("set")
 
     class Bus:
@@ -2143,3 +2143,44 @@ def test_transport_reset_waits_for_pending_connect_to_finish():
     assert len(disconnects) == 1
     supervisor.recover_le_transport()
     assert len(disconnects) == 1
+
+
+@pytest.mark.parametrize("reject_valid_set", [False, True])
+def test_preference_write_uses_variant_on_the_wire_and_surfaces_method_errors(monkeypatch, reject_valid_set):
+    import dbus
+    from dbus.lowlevel import MethodCallMessage
+    from dbus.proxies import ProxyObject
+
+    class Bus:
+        def __init__(self):
+            self.preference = "bredr"
+            self.signatures = []
+
+        def activate_name_owner(self, _name):
+            return ":1.42"
+
+        def get_object(self, name, path, **kwargs):
+            return ProxyObject(self, name, path, **kwargs)
+
+        def call_blocking(self, name, path, interface, method, signature, args, **kwargs):
+            message = MethodCallMessage(name, path, interface, method)
+            message.append(*args, **({"signature": signature} if signature else {}))
+            wire_signature = str(message.get_signature())
+            self.signatures.append((method, wire_signature))
+            if wire_signature != {"Get": "ss", "Set": "ssv"}[method] or (method == "Set" and reject_valid_set):
+                raise dbus.exceptions.DBusException("No matching method", name="org.freedesktop.DBus.Error.UnknownMethod")
+            if method == "Get":
+                return self.preference
+            self.preference = str(message.get_args_list()[2])
+
+    bus = Bus()
+    monkeypatch.setattr(bearer_supervisor, "get_system_bus", lambda: bus)
+    supervisor = BearerSupervisor("/device")
+    if reject_valid_set:
+        with pytest.raises(dbus.exceptions.DBusException):
+            supervisor._prefer_bluez("le")
+        assert bus.preference == "bredr"
+    else:
+        supervisor._prefer_bluez("le")
+        assert bus.preference == "le"
+    assert bus.signatures == [("Get", "ss"), ("Set", "ssv")]
