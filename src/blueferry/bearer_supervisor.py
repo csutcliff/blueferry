@@ -1135,6 +1135,8 @@ class BearerSupervisor:
                 return
         self._clear_connect_request(kind)
         if kind == "le":
+            self._le_autoconnect_disable_pending = True
+            self._suppress_le_autoconnect()
             self._set_le_dial_active(False)
         if kind == "le" and not self._le_enabled:
             # Policy closed the gate while the asynchronous request was in
@@ -1184,6 +1186,9 @@ class BearerSupervisor:
             return
         self._clear_connect_request(kind)
         if kind == "le":
+            if not connected:
+                self._le_autoconnect_disable_pending = True
+                self._suppress_le_autoconnect()
             self._set_le_dial_active(False)
         if connected:
             log.debug("%s bearer InProgress state connected", kind.upper())
@@ -1478,6 +1483,24 @@ class BearerSupervisor:
             current = ""
         else:
             if current == kind:
+                if kind != "bredr":
+                    return
+                # BlueZ 5.87 can retain auto_connect=true after loading a
+                # GATT profile even with PreferredBearer=bredr. Its setter
+                # ignores an unchanged preference, so force a transition.
+                # last-used does not explicitly enable auto-connect (le does).
+                # Always attempt to restore bredr, even if the first reply is
+                # lost after BlueZ has applied the intermediate preference.
+                try:
+                    properties.Set(
+                        "org.bluez.Device1", "PreferredBearer",
+                        dbus.String("last-used"), signature="ssv", timeout=5.0,
+                    )
+                finally:
+                    properties.Set(
+                        "org.bluez.Device1", "PreferredBearer",
+                        dbus.String("bredr"), signature="ssv", timeout=5.0,
+                    )
                 return
         try:
             properties.Set(

@@ -2241,3 +2241,82 @@ def test_unknown_le_state_does_not_rewrite_background_connection_policy() -> Non
     supervisor.enable_le()
     supervisor.poke()
     assert preferences == []
+
+
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_bredr_preference_clears_hidden_autoconnect_even_if_already_selected(
+    monkeypatch, lost_reply,
+) -> None:
+    class Properties:
+        def __init__(self):
+            self.preference = "bredr"
+            self.auto_connect = True
+            self.writes = []
+
+        def Get(self, _interface, _name, **_kwargs):
+            return self.preference
+
+        def Set(self, _interface, _name, value, *, signature, timeout):
+            assert signature == "ssv"
+            value = str(value)
+            self.writes.append(value)
+            # Model BlueZ's unchanged-value early return and its separate
+            # internal auto_connect flag, which profile probing can set.
+            if value == self.preference:
+                return
+            self.preference = value
+            if value == "bredr":
+                self.auto_connect = False
+            elif value == "le":
+                self.auto_connect = True
+            if lost_reply and value == "last-used":
+                raise RuntimeError("reply lost after applying preference")
+
+    props = Properties()
+    class Bus:
+        def get_object(self, *_args, **_kwargs):
+            return object()
+
+    monkeypatch.setattr(bearer_supervisor, "get_system_bus", Bus)
+    monkeypatch.setattr(bearer_supervisor.dbus, "Interface", lambda *_args: props)
+    supervisor = BearerSupervisor("/device")
+    if lost_reply:
+        with pytest.raises(RuntimeError, match="reply lost"):
+            supervisor._prefer_bluez("bredr")
+    else:
+        supervisor._prefer_bluez("bredr")
+    assert props.preference == "bredr"
+    assert props.auto_connect is False
+    assert props.writes == ["last-used", "bredr"]
+
+
+@pytest.mark.parametrize("in_progress", [False, True])
+def test_failed_le_attempt_clears_background_policy_before_restoring_advertisement(in_progress):
+    import dbus
+
+    events = []
+    callbacks = []
+    now = [0.0]
+    scheduled = []
+    supervisor = BearerSupervisor(
+        "/device", read_connected=lambda kind: kind == "bredr",
+        prefer=lambda kind: events.append(("prefer", kind)),
+        connect=lambda _kind, _success, error: callbacks.append(error),
+        on_le_dial=lambda active: events.append(("dial", active)),
+        schedule=lambda delay, cb: scheduled.append((delay, cb)) or 7,
+        cancel=lambda _timer: None, clock=lambda: now[0],
+    )
+    supervisor.start()
+    next(cb for delay, cb in scheduled
+         if delay == bearer_supervisor.CLASSIC_SETTLE_SECONDS)()
+    events.clear()
+    if in_progress:
+        callbacks[0](dbus.exceptions.DBusException(
+            "Operation already in progress", name="org.bluez.Error.InProgress",
+        ))
+        assert events == []
+        now[0] = bearer_supervisor.CONNECT_TIMEOUT_SECONDS + 1
+        supervisor.poke()
+    else:
+        callbacks[0](RuntimeError("le-connection-abort-by-local"))
+    assert events == [("prefer", "bredr"), ("dial", False)]
