@@ -134,10 +134,10 @@ class SolicitationSupervisor:
             # helper-to-daemon handoff. Give the actual broadcast a full hold.
             self._begin_hold()
         self._was_registered = registered
-        if self._dialing:
-            # An outbound dial takes precedence even during the startup
-            # hold: overlapping advertising can abort the connection. Once
-            # the dial finishes, registration starts a fresh inbound hold.
+        if self._dialing and self._clock() >= self._hold_until:
+            # After the post-pair hold, advertising during an outbound dial
+            # can make BlueZ abort its own Connect. During the hold, keep
+            # the advert: that is the inbound door iOS uses.
             if registered or self._is_pending():
                 self._unregister(self.adapter)
                 self._was_registered = False

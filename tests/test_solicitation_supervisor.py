@@ -90,37 +90,27 @@ def test_healthy_ancs_keeps_post_pair_solicitation_for_permission_window() -> No
     assert calls[-1] == ("unregister", "hci7")
 
 
-def test_outbound_dial_interrupts_and_then_renews_startup_hold() -> None:
+def test_outbound_dial_keeps_solicitation_during_post_pair_hold() -> None:
     calls = []
     state = {"registered": False}
     scheduled = []
     now = 0.0
     supervisor = _supervisor(
-        calls, state, scheduled, minimum_on_seconds=180, clock=lambda: now,
+        calls,
+        state,
+        scheduled,
+        minimum_on_seconds=180,
+        clock=lambda: now,
     )
     supervisor.start()
     supervisor.set_dialing(True)
-    assert state["registered"] is False
+
+    assert state["registered"] is True
+    assert ("unregister", "hci7") not in calls
+
+    now = 180.0
+    scheduled[0][1]()
     assert calls[-1] == ("unregister", "hci7")
-
-    # Need changes and periodic checks must not reopen advertising mid-dial.
-    now = 30.0
-    supervisor.set_needed(False)
-    supervisor.set_needed(True)
-    scheduled[0][1]()
-    assert state["registered"] is False
-    assert len(calls) == 2
-
-    now = 45.0
-    supervisor.set_dialing(False)
-    assert state["registered"] is True
-    supervisor.set_needed(False)
-    now = 224.0
-    scheduled[0][1]()
-    assert state["registered"] is True
-    now = 225.0
-    scheduled[0][1]()
-    assert state["registered"] is False
 
 
 def test_outbound_dial_withdraws_and_then_restores_solicitation() -> None:
@@ -225,7 +215,7 @@ def test_stop_cancels_a_registration_that_has_not_finished():
     assert removed == ['hci7']
 
 
-def test_startup_advert_is_withdrawn_before_connect_and_restored_on_failure():
+def test_startup_advert_survives_outbound_connect_and_failure():
     from blueferry.bearer_supervisor import BearerSupervisor
 
     calls, scheduled = [], []
@@ -236,7 +226,7 @@ def test_startup_advert_is_withdrawn_before_connect_and_restored_on_failure():
 
     def connect(kind, _success, failure):
         assert kind == "le"
-        assert not state["registered"]
+        assert state["registered"]
         calls.append(("connect", kind))
         failures.append(failure)
 
@@ -248,9 +238,9 @@ def test_startup_advert_is_withdrawn_before_connect_and_restored_on_failure():
     )
     bearers.start()
     bearers._connect_le_after_settle()
-    assert calls == [("register", "hci7"), ("unregister", "hci7"), ("connect", "le")]
+    assert calls == [("register", "hci7"), ("connect", "le")]
     failures[0](RuntimeError("connection failed"))
-    assert calls[-1] == ("register", "hci7")
+    assert calls == [("register", "hci7"), ("connect", "le")]
     assert advert.active()
     bearers.stop()
     advert.stop()
