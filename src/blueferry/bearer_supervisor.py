@@ -241,6 +241,7 @@ class BearerSupervisor:
         disconnect: Disconnect | None = None,
         prefer: Prefer | None = None,
         inbound_le_primed: InboundLePrimed | None = None,
+        solicitation_first: bool = False,
         watch_le: WatchLe | None = None,
         le_bond_detection: Callable[[], bool] | None = None,
         on_le_bond_report: Callable[[], None] | None = None,
@@ -259,6 +260,7 @@ class BearerSupervisor:
             self._prefer_bluez if connect is None else lambda _kind: None
         )
         self._inbound_le_primed = inbound_le_primed or (lambda: True)
+        self._solicitation_first = solicitation_first
         # Injected fakes replace BlueZ entirely; only the production
         # supervisor subscribes to the real bearer signals.
         self._watch_le = watch_le or (
@@ -303,11 +305,12 @@ class BearerSupervisor:
         self._le_targeting_hint = False
         self._le_dial_active = False
         self._le_autoconnect_disable_pending = True
-        # Outbound Bearer.LE1.Connect is only a bootstrap hint.  Real-device
-        # traces show the solicitation advertisement to be the reliable
-        # reconnect path, while repeating Connect can leave BlueZ in an
-        # InProgress loop.  Spend one dial, then leave the radio to solicitation
-        # until BlueZ is replaced or ANCS deliberately resets the transport.
+        # Outbound Bearer.LE1.Connect is only a bootstrap hint. Real-device
+        # traces show successful inbound solicitation, while repeating
+        # Connect can leave BlueZ in an
+        # InProgress loop. ANCS uses solicitation_first to skip even this
+        # bootstrap while its advertisement is registered. Otherwise spend
+        # one dial before yielding to solicitation.
         self._le_dial_spent = False
         self._le_reset_pending = False
         self._le_reset_failures = 0
@@ -393,7 +396,7 @@ class BearerSupervisor:
         if self._le_enabled:
             return
         self._le_enabled = True
-        log.info("MAP/PBAP attempt completed; enabling outbound iPhone LE bootstrap")
+        log.info("MAP/PBAP attempt completed; enabling iPhone LE recovery")
         if self._states["le"] is False:
             # PreferredBearer=le enables BlueZ/kernel auto-connect, which can
             # keep initiating after our bounded dial has ended and starve the
@@ -1249,8 +1252,17 @@ class BearerSupervisor:
         self._le_autoconnect_disable_pending = False
 
     def _le_dial_exhausted(self) -> bool:
-        """Yield to inbound solicitation only when it is actually on air."""
-        return self._le_dial_spent and self._inbound_le_primed()
+        """Yield to inbound solicitation only when it is actually on air.
+
+        Some kernels reuse an LE connection with a cached private address
+        but its old public address type (upstream fix 555cd2bd860e). Incoming
+        connections avoid that path. Do not withdraw a working solicitation
+        for an outbound bootstrap, including after a disconnect or reset.
+        Controllers without advertising retain the bounded outbound fallback.
+        """
+        return (
+            self._solicitation_first or self._le_dial_spent
+        ) and self._inbound_le_primed()
 
     def _set_le_dial_active(self, active: bool) -> None:
         """Publish one LE dial's lifetime so solicitation cannot overlap it."""

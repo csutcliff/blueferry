@@ -2320,3 +2320,72 @@ def test_failed_le_attempt_clears_background_policy_before_restoring_advertiseme
     else:
         callbacks[0](RuntimeError("le-connection-abort-by-local"))
     assert events == [("prefer", "bredr"), ("dial", False)]
+
+
+@pytest.mark.parametrize("transition", ["startup", "classic_return", "le_drop", "bluez_restart", "transport_reset"])
+def test_solicitation_first_never_dials_over_registered_advert(transition) -> None:
+    state = {"bredr": True, "le": False}
+    connections = []
+    preferences = []
+    dial_states = []
+    scheduled = []
+    now = 0.0
+    supervisor = BearerSupervisor(
+        "/device",
+        solicitation_first=True,
+        inbound_le_primed=lambda: True,
+        read_connected=state.get,
+        connect=lambda kind, *_args: connections.append(kind),
+        disconnect=lambda _kind, success, _error: success(),
+        prefer=preferences.append,
+        on_le_dial=dial_states.append,
+        schedule=lambda delay, callback: scheduled.append((delay, callback)) or len(scheduled),
+        cancel=lambda _timer: None,
+        clock=lambda: now,
+    )
+    supervisor.start()
+    if transition == "classic_return":
+        state["bredr"] = False
+        supervisor.poke()
+        state["bredr"] = True
+    elif transition == "le_drop":
+        state["le"] = True
+        supervisor.poke()
+        state["le"] = False
+    elif transition == "bluez_restart":
+        supervisor.reset_after_bluez_restart()
+    elif transition == "transport_reset":
+        supervisor.recover_le_transport(allow_disconnected=True)
+    supervisor.poke()
+    now = 600.0
+    supervisor.poke()
+    assert "le" not in connections
+    assert dial_states == []
+    assert preferences and set(preferences) == {"bredr"}
+    assert all(delay != bearer_supervisor.CLASSIC_SETTLE_SECONDS for delay, _ in scheduled)
+
+
+def test_solicitation_first_rechecks_registration_before_outbound_fallback() -> None:
+    active = False
+    connections = []
+    scheduled = []
+    supervisor = BearerSupervisor(
+        "/device",
+        solicitation_first=True,
+        inbound_le_primed=lambda: active,
+        read_connected={"bredr": True, "le": False}.get,
+        connect=lambda kind, *_args: connections.append(kind),
+        schedule=lambda delay, callback: scheduled.append((delay, callback)) or len(scheduled),
+        cancel=lambda _timer: None,
+    )
+    supervisor.start()
+    settle = scheduled[0][1]
+    # Registration completes while Classic is settling: preserve the advert.
+    active = True
+    settle()
+    assert connections == []
+    # If advertising later becomes unavailable, fallback is still possible.
+    active = False
+    supervisor.poke()
+    scheduled[-1][1]()
+    assert connections == ["le"]
