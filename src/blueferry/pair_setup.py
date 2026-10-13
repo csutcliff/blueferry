@@ -109,14 +109,16 @@ _LE_REPROBE_DELAYS_SECONDS = (1.0, 2.0)
 _sleep = time.sleep
 
 
-def configuration_status() -> dict:
+def configuration_status(*, check_bond: bool = True) -> dict:
     """Return first-run state without activating the user daemon."""
     values = config.read_local_env(LOCAL_ENV_PATH)
     mac = values.get("BLUEFERRY_MAC", "").upper()
     saved = bool(config.is_valid_mac(mac) and mac != "AA:BB:CC:DD:EE:FF")
     configured_adapter = values.get("BLUEFERRY_ADAPTER", "")
     adapter = configured_adapter if config.is_valid_adapter(configured_adapter) else config.ADAPTER
-    bonded = bond_status(mac, adapter) if saved else False
+    # History can be displayed from the saved target while Bluetooth is slow
+    # or unavailable. Its live bond is then unknown, not confirmed or lost.
+    bonded = (bond_status(mac, adapter) if check_bond else None) if saved else False
     # A temporary BlueZ failure should not erase a valid setup decision. A
     # definitive, reachable adapter with no bond means setup is incomplete.
     configured = saved and bonded is not False
