@@ -23,6 +23,9 @@ _EMAIL_SHAPED = re.compile(
     r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@"
     r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
 )
+# Short codes, and alphanumeric sender IDs that the iPhone's MAP server spells
+# as keypad digits ("MBNA" arrives as "6262"), are too short to be phone numbers.
+_SHORT_CODE = re.compile(r"[0-9]{3,6}")
 
 def normalize_phone(raw: str | None) -> str | None:
     """Reduce a phone string to digits only (E.164-ish minus the +).
@@ -65,6 +68,8 @@ def canonical_address(raw: str | None) -> str | None:
         return f"phone:{phone}"
     if is_email_shaped(value):
         return f"email:{value.casefold()}"
+    if _SHORT_CODE.fullmatch(value):
+        return f"short:{value}"
     return None
 
 
