@@ -58,6 +58,23 @@ def test_short_code_sender_gets_its_own_thread() -> None:
     assert thread_key(first) == thread_key(second)
 
 
+def test_stored_alphanumeric_name_makes_thread_read_only() -> None:
+    stored = _sms("7467", "", "one", "2026-08-08T10:00:00+00:00")
+    stored["sender_alphanumeric"] = "shop"
+    titled = _sms("7467", "", "two", "2026-08-08T10:01:00+00:00")
+    titled["sender_alphanumeric"] = "Shop"
+    later = _sms("7467", "", "three", "2026-08-08T10:02:00+00:00")
+    later["sender_alphanumeric"] = "shop"
+
+    thread = build_threads([stored, titled, later])[0]
+    alone = build_threads([stored])[0]
+
+    assert thread["name"] == "Shop"
+    assert thread["reply_ready"] is False
+    assert alone["name"] == "shop"
+    assert alone["reply_ready"] is False
+
+
 def test_untrusted_non_address_cannot_become_reply_thread() -> None:
     event = _sms("Mom<script>", "", "bad", "2026-08-08T10:00:00+00:00")
     assert thread_key(event) is None
